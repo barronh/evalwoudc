@@ -1,4 +1,6 @@
-MODLABEL=CMAQ
+ifndef MODLABEL
+MODLABEL=MOD
+endif
 MODSRC=$(sort $(wildcard ../mod/*.nc))
 OBSSRC=$(sort $(wildcard ../obs/*.nc))
 STARGETS=$(addsuffix _ALL.png,$(basename $(notdir $(MODSRC)))) \
