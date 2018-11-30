@@ -19,7 +19,7 @@ locations.json: dataupdated
 	python getlocs.py $(DATAROOT)
 
 dataupdated: urls.csv
-	cd $(DATAROOT); wget -i --continue $(PWD)/urls.csv
+	cd $(DATAROOT); wget --continue -i $(PWD)/urls.csv
 	python filecleaner.py $(DATAROOT)/*
 	date > dataupdated
 
