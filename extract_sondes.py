@@ -231,7 +231,7 @@ for prefix, opts in locations.items():
             hidx = int((modh - hoffset) // args.hours)
             print('New hidx:', hidx)
 
-        sdims = {dim2dim['time']: [int(modh // args.hours)],
+        sdims = {dim2dim['time']: [hidx],
                  dim2dim['latitude']: modj,
                  dim2dim['longitude']: modi}
 
