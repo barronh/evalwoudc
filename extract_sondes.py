@@ -9,11 +9,13 @@ import matplotlib.pyplot as plt
 from PseudoNetCDF import pncopen, pncwrite
 import argparse
 from collections import OrderedDict
+from extrareader import readers
+
 strptime = datetime.strptime
 parser = argparse.ArgumentParser()
 parser.add_argument('-v', '--verbose', action = 'count', default = 0, help = 'Show more by adding more -v')
 parser.add_argument('--hourly-interval', type = float, default = 1, help = 'Hours between times', dest = 'hours')
-parser.add_argument('-t', '--in-type', default = 'GEOS-Chem', choices = ['GEOS-Chem', 'CMAQ', 'CAMx'], help = 'Model for meta-data')
+parser.add_argument('-t', '--in-type', default = 'GEOS-Chem', choices = ['GEOS-Chem', 'CMAQ', 'CAMx'] + readers, help = 'Model for meta-data')
 parser.add_argument('--sonde-format', default = 'l100', choices = ['l100', 'woudcsonde'], help = 'Sonde text format (NOAA l100 or woudc sonde format', dest = 'sondeformat')
 parser.add_argument('-l', '--locations', default = 'locations.json', help = 'File with sonde locations')
 parser.add_argument('--sondes', type = lambda x: x.split(','), default = [], help = 'Two character sonde ids')
@@ -26,24 +28,39 @@ args = parser.parse_args()
 locations = json.load(open(args.locations), object_pairs_hook=OrderedDict)
 intype = args.in_type
 intemplate = args.intemplate
-sondekeepvars = dict(l100 = ['time', 'Press', 'latitude', 'longitude', 'O3'],
+sondekeepvar = dict(l100 = ['time', 'Press', 'latitude', 'longitude', 'O3'],
                      woudcsonde = ['time', 'Pressure', 'PLATFORM_Name', 'PLATFORM_ID', 'LOCATION_Latitude', 'LOCATION_Longitude', 'LOCATION_Height', 'O3'])[args.sondeformat]
 
 # input format options
-modformat = {'GEOS-Chem': dict(format = 'bpch', nogroup = True),
-             'CAMx': dict(format = 'uamiv'),
-             'CMAQ': dict(format = 'ioapi')}[intype]
+modformats = {
+    'GEOS-Chem': dict(format = 'bpch', nogroup = True),
+    'CAMx': dict(format = 'uamiv'),
+    'CMAQ': dict(format = 'ioapi'),
+}
+if intype in modformats:
+    modformat = modformats[intype]
+else:
+    modformat = dict(format=intype)
 
 # dimensions translations
-dim2dim = {
-           'GEOS-Chem': dict(time = 'time', longitude = 'longitude', latitude = 'latitude'),
-           'CAMx': dict(time = 'TSTEP', longitude = 'COL', latitude = 'ROW'),
-           'CMAQ': dict(time = 'TSTEP', longitude = 'COL', latitude = 'ROW')}[intype]
+dim2dims = {
+    'CAMx': dict(time = 'TSTEP', longitude = 'COL', latitude = 'ROW'),
+    'CMAQ': dict(time = 'TSTEP', longitude = 'COL', latitude = 'ROW')
+}
+
+if intype in dim2dims:
+    dim2dim = dim2dims[intype]
+else:
+    dim2dim = dict(time = 'time', longitude = 'longitude', latitude = 'latitude')
+
 # vars to keep from model in output
 keepvars = { 
-            'GEOS-Chem': ['time', 'longitude', 'latitude', 'O3', 'hyai', 'hybi'],
-            'CAMx': ['TFLAG', 'O3'],
-            'CMAQ': ['TFLAG', 'O3']}[intype]
+    'GEOS-Chem': ['time', 'longitude', 'latitude', 'O3', 'hyai', 'hybi'],
+    'CAMx': ['TFLAG', 'O3'],
+    'CMAQ': ['TFLAG', 'O3']
+}
+
+keepvar = keepvars.get(intype, None)
 
 season_months = dict(DJF = [12, 1, 2], MAM = [3, 4, 5], JJA = [6, 7, 8], SON = [9, 10, 11])
 if args.season == 'ALL':
@@ -57,6 +74,12 @@ print(months)
 debug = False
 dothese = args.sondes
 for prefix, opts in locations.items():
+    modoutpath = args.modouttemp.format(prefix, args.season)
+    sondeoutpath = args.sondeouttemp.format(prefix, args.season)
+    if os.path.exists(modoutpath) and os.path.exists(sondeoutpath):
+        print('Using cached:\n - {}\n - {}' .format(modoutpath, sondeoutpath))
+        continue
+
     if not prefix in dothese and len(dothese) != 0: continue
     print(prefix)
     lon = opts['Longitude']
@@ -108,15 +131,15 @@ for prefix, opts in locations.items():
     tmpf = pncopen(modpaths[0], **modformat, addcf = False)
     
     # Use temp file to calculate i, j indices and ensure they are not arrays
+    nrow = len(tmpf.dimensions[dim2dim['latitude']])
+    ncol = len(tmpf.dimensions[dim2dim['longitude']])
     try:
         modi, modj = tmpf.ll2ij(lon, lat)
         modi = int(modi)
         modj = int(modj)
         if (modi < 0) or (modj < 0): raise ValueError()
-        nrow = len(tmpf.dimensions[dim2dim['latitude']])
-        ncol = len(tmpf.dimensions[dim2dim['longitude']])
         if (modi >= ncol) or (modj >= nrow): raise ValueError()
-    except:
+    except Exception:
         print('Skipping', prefix, 'not in domain')
         continue
     
@@ -141,28 +164,40 @@ for prefix, opts in locations.items():
         # Open SONDE files using the PNC.noaafiles.l100 reader
         sondef = pncopen(sondepath, format = args.sondeformat, addcf = False)
         
+        # 1. Open SONDE files using the PNC.geoschemfiles.bpch,
+        #    PNC.camxfiles.Memmaps.uamv, or PNC.cmaqfiles.ioapi
+        # 2. optionally, subset variables
+        vmodf = pncopen(modpath, **modformat, addcf = False)
+        if keepvar is not None:
+            vmodf = vmodf.subsetVariables(keepvar)
+
         # create a slicing dictionary where modh is converted
         # t otime index and dimension names are consistent
         # with the time step
+        hoffset = int(vmodf.getTimes()[0].hour)
+        hidx = int(modh // args.hours)
+        if hoffset != 0:
+            print('Not starting at 0:', hoffset)
+            print('Old hidx:', hidx)
+            hidx = int((modh - hoffset) // args.hours)
+            print('New hidx:', hidx)
+        
         sdims = {dim2dim['time']: [int(modh // args.hours)],
                  dim2dim['latitude']: modj,
                  dim2dim['longitude']: modi}
         
-        # 1. Open SONDE files using the PNC.geoschemfiles.bpch,
-        #    PNC.camxfiles.Memmaps.uamv, or PNC.cmaqfiles.ioapi
-        # 2. subset variables
         # 3. slice dimensions to get sonde location
         # 4. remove latitude and longitude, which sould now be singletons
-        modf = pncopen(modpath, **modformat, addcf = False).subsetVariables(keepvars)\
-                                                           .sliceDimensions(**sdims)\
-                                                           .removeSingleton(dim2dim['latitude'])\
-                                                           .removeSingleton(dim2dim['longitude'])
+        modf = vmodf.sliceDimensions(**sdims)\
+                    .removeSingleton(dim2dim['latitude'])\
+                    .removeSingleton(dim2dim['longitude'])
+
         # 1. Average sondefile to Sigma structure
         # 2. subest for just eh variables to keep
         # 3. rename the singleton site dimension to time
         # 4. take only the first sonde "level" (all sigma levels are retained
         satmodf = sondef.avgSigma(**levelkwds, copyall = True)\
-                        .subsetVariables(sondekeepvars)\
+                        .subsetVariables(sondekeepvar)\
                         .renameDimension('flight', dim2dim['time'])\
                         .sliceDimensions(level = 0)
         for dk in list(satmodf.dimensions):
@@ -182,7 +217,7 @@ for prefix, opts in locations.items():
     
     # After all flights for a sonde have been processed
     # write out the model and sonde file
-    pncwrite(modoutfile, args.modouttemp.format(prefix, args.season), format = 'NETCDF4')
-    pncwrite(sondeoutfile, args.sondeouttemp.format(prefix, args.season), format = 'NETCDF4')
+    pncwrite(modoutfile, modoutpath, format = 'NETCDF4')
+    pncwrite(sondeoutfile, sondeoutpath, format = 'NETCDF4')
 
 os.system('date > ncupdated')
